@@ -386,15 +386,27 @@ impl RoonDaemon {
         let connection_state_clone = connection_state.clone();
         
         tokio::spawn(async move {
+            let mut retry_count = 0;
+            let max_retry_delay = Duration::from_secs(300); // 5 minutes max
+            
             loop {
-                println!("Daemon: Attempting to connect to Roon...");
+                println!("Daemon: Attempting to connect to Roon... (attempt {})", retry_count + 1);
                 
                 if let Err(e) = Self::establish_connection(zones_clone.clone(), transport_clone.clone(), connection_state_clone.clone()).await {
-                    eprintln!("Daemon: Connection failed: {}, retrying in 10 seconds...", e);
-                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    retry_count += 1;
+                    
+                    // Exponential backoff: 2^retry_count seconds, capped at max_retry_delay
+                    let base_delay = Duration::from_secs(2_u64.pow(retry_count.min(8))); // Cap at 2^8 = 256s
+                    let delay = base_delay.min(max_retry_delay);
+                    
+                    eprintln!("Daemon: Connection failed: {}, retrying in {}s... (attempt {})", 
+                        e, delay.as_secs(), retry_count);
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
-                println!("Daemon: Connection lost, attempting to reconnect in 5 seconds...");
+                // Connection was successful, reset retry count
+                retry_count = 0;
+                println!("Daemon: Connection lost, attempting to reconnect...");
                 
                 // Mark as disconnected
                 {
@@ -402,7 +414,8 @@ impl RoonDaemon {
                     *state = ConnectionState::Disconnected;
                 }
                 
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                // Brief pause before reconnection attempt
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
         
@@ -477,9 +490,19 @@ impl RoonDaemon {
             }
             
             let mut transport_subscribed = false;
+            let connection_start = std::time::Instant::now();
+            let mut ready_timeout_warned = false;
             
             // Process events - this is the persistent connection loop
             while let Some((core_event, msg)) = core_rx.recv().await {
+                // Check for Ready state timeout
+                if !ready_timeout_warned && connection_start.elapsed() > Duration::from_secs(30) {
+                    let current_state = connection_state.lock().unwrap().clone();
+                    if current_state != ConnectionState::Ready {
+                        println!("FLOW: Warning - not Ready after 30s, current state: {:?}", current_state);
+                        ready_timeout_warned = true;
+                    }
+                }
                 match core_event {
                     roon_api::CoreEvent::Discovered(mut core, _) => {
                         println!("Daemon: Core discovered");
@@ -492,8 +515,15 @@ impl RoonDaemon {
                                 }
                                 println!("Daemon: Got transport service, subscribing to zones...");
                                 println!("FLOW: Calling transport_service.subscribe_zones()");
-                                transport_service.subscribe_zones().await;
-                                println!("FLOW: subscribe_zones() completed successfully");
+                                match timeout(Duration::from_secs(15), transport_service.subscribe_zones()).await {
+                                    Ok(_) => {
+                                        println!("FLOW: subscribe_zones() completed successfully");
+                                    }
+                                    Err(_) => {
+                                        println!("FLOW: subscribe_zones() timed out after 15s - continuing anyway");
+                                        // Don't fail completely, zones might arrive later
+                                    }
+                                }
                                 transport_subscribed = true;
                             }
                         }
@@ -508,8 +538,15 @@ impl RoonDaemon {
                                 }
                                 println!("Daemon: Got transport service, subscribing to zones...");
                                 println!("FLOW: Calling transport_service.subscribe_zones()");
-                                transport_service.subscribe_zones().await;
-                                println!("FLOW: subscribe_zones() completed successfully");
+                                match timeout(Duration::from_secs(15), transport_service.subscribe_zones()).await {
+                                    Ok(_) => {
+                                        println!("FLOW: subscribe_zones() completed successfully");
+                                    }
+                                    Err(_) => {
+                                        println!("FLOW: subscribe_zones() timed out after 15s - continuing anyway");
+                                        // Don't fail completely, zones might arrive later
+                                    }
+                                }
                                 transport_subscribed = true;
                             }
                         }
@@ -765,7 +802,18 @@ impl RoonDaemon {
         };
         
         // Send the control command
-        transport_clone.control(&zone_clone.zone_id, &control).await;
+        match timeout(Duration::from_secs(10), transport_clone.control(&zone_clone.zone_id, &control)).await {
+            Ok(_) => {
+                println!("FLOW: execute_transport - control command sent successfully");
+            }
+            Err(_) => {
+                return IpcResponse {
+                    status: "error".to_string(),
+                    data: None,
+                    message: Some(format!("Transport command '{}' timed out after 10s", action)),
+                };
+            }
+        }
         
         IpcResponse {
             status: "ok".to_string(),
