@@ -3,6 +3,14 @@ use roon_api::{Info, RoonApi, Services, transport::{Transport, Control, State}, 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+
+#[derive(Debug, Clone, PartialEq)]
+enum ConnectionState {
+    Connecting,
+    Connected,     // Transport service available
+    Ready,         // Zones data available
+    Disconnected,
+}
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::time::{timeout, Duration};
@@ -239,7 +247,7 @@ async fn setup_authorization(ip: Option<&str>) -> Result<(), Box<dyn std::error:
 struct RoonDaemon {
     zones: Arc<Mutex<Vec<Zone>>>,
     transport: Arc<Mutex<Option<Transport>>>,
-    connected: Arc<Mutex<bool>>,
+    connection_state: Arc<Mutex<ConnectionState>>,
 }
 
 fn get_socket_path() -> PathBuf {
@@ -364,24 +372,24 @@ impl RoonDaemon {
     async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let zones = Arc::new(Mutex::new(Vec::new()));
         let transport = Arc::new(Mutex::new(None));
-        let connected = Arc::new(Mutex::new(false));
+        let connection_state = Arc::new(Mutex::new(ConnectionState::Connecting));
         
         let daemon = RoonDaemon {
             zones: zones.clone(),
             transport: transport.clone(),
-            connected: connected.clone(),
+            connection_state: connection_state.clone(),
         };
         
         // Start the persistent connection in a background task
         let zones_clone = zones.clone();
         let transport_clone = transport.clone();
-        let connected_clone = connected.clone();
+        let connection_state_clone = connection_state.clone();
         
         tokio::spawn(async move {
             loop {
                 println!("Daemon: Attempting to connect to Roon...");
                 
-                if let Err(e) = Self::establish_connection(zones_clone.clone(), transport_clone.clone(), connected_clone.clone()).await {
+                if let Err(e) = Self::establish_connection(zones_clone.clone(), transport_clone.clone(), connection_state_clone.clone()).await {
                     eprintln!("Daemon: Connection failed: {}, retrying in 10 seconds...", e);
                     tokio::time::sleep(Duration::from_secs(10)).await;
                     continue;
@@ -390,8 +398,8 @@ impl RoonDaemon {
                 
                 // Mark as disconnected
                 {
-                    let mut conn = connected_clone.lock().unwrap();
-                    *conn = false;
+                    let mut state = connection_state_clone.lock().unwrap();
+                    *state = ConnectionState::Disconnected;
                 }
                 
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -404,7 +412,7 @@ impl RoonDaemon {
     async fn establish_connection(
         zones: Arc<Mutex<Vec<Zone>>>,
         transport: Arc<Mutex<Option<Transport>>>,
-        connected: Arc<Mutex<bool>>,
+        connection_state: Arc<Mutex<ConnectionState>>,
     ) -> Result<(), String> {
         let mut roon = RoonApi::new(create_roon_info());
         
@@ -461,10 +469,11 @@ impl RoonDaemon {
             let transport_clone = transport.clone();
             let config_path_for_save_clone = config_path_for_save.clone();
             
-            // Mark as connected
+            // Mark as connected (transport available)
             {
-                let mut conn = connected.lock().unwrap();
-                *conn = true;
+                let mut state = connection_state.lock().unwrap();
+                *state = ConnectionState::Connected;
+                println!("FLOW: Connection state -> Connected (transport available)");
             }
             
             let mut transport_subscribed = false;
@@ -540,6 +549,12 @@ impl RoonDaemon {
                                 *z = zone_list;
                             }
                             println!("Daemon: Updated zone list (zones: {})", zones.lock().unwrap().len());
+                            // Mark as ready when we have zone data
+                            {
+                                let mut state = connection_state.lock().unwrap();
+                                *state = ConnectionState::Ready;
+                                println!("FLOW: Connection state -> Ready (zones available)");
+                            }
                         }
                         _ => {
                             match parsed {
@@ -568,19 +583,46 @@ impl RoonDaemon {
     }
     
     async fn get_status(&self) -> IpcResponse {
-        let connected = *self.connected.lock().unwrap();
-        println!("FLOW: get_status called - connected: {}", connected);
+        let state = self.connection_state.lock().unwrap().clone();
+        println!("FLOW: get_status called - state: {:?}", state);
         
-        if !connected {
-            return IpcResponse {
-                status: "ok".to_string(),
-                data: Some(json!({
-                    "text": "♪ Connecting...",
-                    "tooltip": "Roon: Connecting to server",
-                    "class": "connecting"
-                })),
-                message: None,
-            };
+        match state {
+            ConnectionState::Connecting => {
+                return IpcResponse {
+                    status: "ok".to_string(),
+                    data: Some(json!({
+                        "text": "♪ Connecting...",
+                        "tooltip": "Roon: Connecting to server",
+                        "class": "connecting"
+                    })),
+                    message: None,
+                };
+            }
+            ConnectionState::Connected => {
+                return IpcResponse {
+                    status: "ok".to_string(),
+                    data: Some(json!({
+                        "text": "♪ Loading zones...",
+                        "tooltip": "Roon: Transport connected, loading zones",
+                        "class": "loading"
+                    })),
+                    message: None,
+                };
+            }
+            ConnectionState::Disconnected => {
+                return IpcResponse {
+                    status: "ok".to_string(),
+                    data: Some(json!({
+                        "text": "♪ Disconnected",
+                        "tooltip": "Roon: Connection lost",
+                        "class": "disconnected"
+                    })),
+                    message: None,
+                };
+            }
+            ConnectionState::Ready => {
+                // Continue to zone processing below
+            }
         }
         
         let zones = self.zones.lock().unwrap();
@@ -634,14 +676,20 @@ impl RoonDaemon {
     }
     
     async fn execute_transport(&self, action: &str) -> IpcResponse {
-        let connected = *self.connected.lock().unwrap();
+        let state = self.connection_state.lock().unwrap().clone();
+        println!("FLOW: execute_transport called - action: {}, state: {:?}", action, state);
         
-        if !connected {
-            return IpcResponse {
-                status: "error".to_string(),
-                data: None,
-                message: Some("Not connected to Roon".to_string()),
-            };
+        match state {
+            ConnectionState::Ready => {
+                // Continue with transport execution below
+            }
+            _ => {
+                return IpcResponse {
+                    status: "error".to_string(),
+                    data: None,
+                    message: Some(format!("Cannot execute transport - state: {:?}", state)),
+                };
+            }
         }
         
         // Clone the transport and zone data to avoid holding locks across await
