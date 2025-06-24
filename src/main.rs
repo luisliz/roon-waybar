@@ -455,6 +455,7 @@ impl RoonDaemon {
         
         if let Some((_handlers, mut core_rx)) = connection_result {
             println!("Daemon: Connection established, processing events...");
+            println!("FLOW: Starting event processing loop - waiting for core events");
             
             let zones_clone_for_core = zones.clone();
             let transport_clone = transport.clone();
@@ -473,6 +474,7 @@ impl RoonDaemon {
                 match core_event {
                     roon_api::CoreEvent::Discovered(mut core, _) => {
                         println!("Daemon: Core discovered");
+                        println!("FLOW: CoreEvent::Discovered received - transport_subscribed: {}", transport_subscribed);
                         if !transport_subscribed {
                             if let Some(transport_service) = core.get_transport() {
                                 {
@@ -480,7 +482,9 @@ impl RoonDaemon {
                                     *t = Some(transport_service.clone());
                                 }
                                 println!("Daemon: Got transport service, subscribing to zones...");
+                                println!("FLOW: Calling transport_service.subscribe_zones()");
                                 transport_service.subscribe_zones().await;
+                                println!("FLOW: subscribe_zones() completed successfully");
                                 transport_subscribed = true;
                             }
                         }
@@ -494,7 +498,9 @@ impl RoonDaemon {
                                     *t = Some(transport_service.clone());
                                 }
                                 println!("Daemon: Got transport service, subscribing to zones...");
+                                println!("FLOW: Calling transport_service.subscribe_zones()");
                                 transport_service.subscribe_zones().await;
+                                println!("FLOW: subscribe_zones() completed successfully");
                                 transport_subscribed = true;
                             }
                         }
@@ -507,7 +513,8 @@ impl RoonDaemon {
                 }
                 
                 // Handle messages
-                if let Some((_msg_type, parsed)) = msg {
+                if let Some((msg_type, parsed)) = msg {
+                    println!("FLOW: Message received - type: {:?}", msg_type);
                     match parsed {
                         Parsed::RoonState(state) => {
                             println!("Daemon: Saving new authorization state");
@@ -520,6 +527,14 @@ impl RoonDaemon {
                             }
                         }
                         Parsed::Zones(zone_list) => {
+                            println!("FLOW: Zones message received - count: {}", zone_list.len());
+                            if !zone_list.is_empty() {
+                                println!("FLOW: First zone - id: {}, display_name: {}, state: {:?}", 
+                                    &zone_list[0].zone_id[..8], zone_list[0].display_name, zone_list[0].state);
+                                if let Some(ref now_playing) = zone_list[0].now_playing {
+                                    println!("FLOW: Now playing - track: {}", now_playing.one_line.line1);
+                                }
+                            }
                             {
                                 let mut z = zones_clone_for_core.lock().unwrap();
                                 *z = zone_list;
@@ -527,7 +542,18 @@ impl RoonDaemon {
                             println!("Daemon: Updated zone list (zones: {})", zones.lock().unwrap().len());
                         }
                         _ => {
-                            println!("Daemon: Received other message: {:?}", parsed);
+                            match parsed {
+                                Parsed::ZonesSeek(ref seeks) if !seeks.is_empty() => {
+                                    // Only log every 10th seek to avoid spam
+                                    if seeks[0].seek_position.unwrap_or(0) % 10 == 0 {
+                                        println!("FLOW: ZonesSeek - position: {:?}, remaining: {}", 
+                                            seeks[0].seek_position, seeks[0].queue_time_remaining);
+                                    }
+                                },
+                                _ => {
+                                    println!("Daemon: Received other message: {:?}", parsed);
+                                }
+                            }
                         }
                     }
                 }
@@ -543,6 +569,7 @@ impl RoonDaemon {
     
     async fn get_status(&self) -> IpcResponse {
         let connected = *self.connected.lock().unwrap();
+        println!("FLOW: get_status called - connected: {}", connected);
         
         if !connected {
             return IpcResponse {
@@ -557,7 +584,9 @@ impl RoonDaemon {
         }
         
         let zones = self.zones.lock().unwrap();
+        println!("FLOW: get_status - zones.len(): {}", zones.len());
         if let Some(zone) = zones.first() {
+            println!("FLOW: get_status - returning status for zone: {}", &zone.zone_id[..8]);
             let text = if let Some(now_playing) = &zone.now_playing {
                 format!("♪ {}", now_playing.one_line.line1)
             } else {
