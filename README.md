@@ -8,7 +8,7 @@ A fast, reliable waybar module for Roon music control with real-time updates.
 - ⚡ **Lightning-fast controls** - Play/pause/next/previous with < 10ms response
 - 🔄 **Persistent connection** - No connection delays, works offline-first  
 - 🎯 **Perfect waybar integration** - JSON output with CSS class support
-- 🛡️ **Rock-solid reliability** - Auto-reconnection and error recovery
+- 🛡️ **Enterprise-grade reliability** - Smart reconnection, timeouts, and graceful recovery
 
 ## 🚀 Quick Start
 
@@ -98,6 +98,14 @@ Add to your waybar `style.css`:
     color: #f9e2af;  /* Yellow when paused */
 }
 
+#custom-roon.connecting {
+    color: #89b4fa;  /* Blue when connecting */
+}
+
+#custom-roon.loading {
+    color: #fab387;  /* Orange when loading zones */
+}
+
 #custom-roon.disconnected {
     color: #f38ba8;  /* Red when disconnected */
 }
@@ -185,6 +193,11 @@ roon-waybar setup --ip 127.0.0.1
 - Make sure you're using the release build: `cargo build --release`
 - Check daemon logs for connection issues
 
+**Status shows "Connecting..." or "Loading zones..."**
+- This is normal during startup - the daemon uses granular connection states
+- Should transition to "Ready" within 30 seconds
+- If stuck, check Roon Core accessibility and authorization
+
 ## 📋 Requirements
 
 - **Rust** (for building)
@@ -202,6 +215,15 @@ This module uses a **daemon architecture**:
 4. **Instant responses** - no connection delays for waybar
 
 This provides the responsiveness of a native desktop app with the simplicity waybar modules expect.
+
+### 🔧 Enhanced Reliability Features
+
+- **Granular Connection States**: Clear status progression (Connecting → Connected → Ready)
+- **Smart Retry Logic**: Exponential backoff prevents server overload (2s → 5min)  
+- **Comprehensive Timeouts**: Zone subscription (15s), transport commands (10s)
+- **Zone Intelligence**: Prefers zones with active tracks and enabled controls
+- **Data Validation**: Ensures zone completeness before Ready state
+- **Graceful Degradation**: Clear error messages and fallback behavior
 
 ## 📖 Documentation
 
