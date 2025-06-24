@@ -492,16 +492,33 @@ impl RoonDaemon {
             let mut transport_subscribed = false;
             let connection_start = std::time::Instant::now();
             let mut ready_timeout_warned = false;
+            let mut zone_refresh_attempts = 0;
+            let mut last_zone_check = std::time::Instant::now();
             
             // Process events - this is the persistent connection loop
             while let Some((core_event, msg)) = core_rx.recv().await {
-                // Check for Ready state timeout
+                // Check for Ready state timeout and zone data health
                 if !ready_timeout_warned && connection_start.elapsed() > Duration::from_secs(30) {
                     let current_state = connection_state.lock().unwrap().clone();
                     if current_state != ConnectionState::Ready {
                         println!("FLOW: Warning - not Ready after 30s, current state: {:?}", current_state);
                         ready_timeout_warned = true;
                     }
+                }
+                
+                // Periodic zone data validation (every 10 seconds)
+                if transport_subscribed && last_zone_check.elapsed() > Duration::from_secs(10) {
+                    let current_state = connection_state.lock().unwrap().clone();
+                    if current_state == ConnectionState::Connected {
+                        // We have transport but no zones yet
+                        zone_refresh_attempts += 1;
+                        if zone_refresh_attempts <= 3 {
+                            println!("FLOW: Zone data missing after subscription, attempt {} to refresh", zone_refresh_attempts);
+                            // Note: We can't force a zone refresh easily, but we can log the issue
+                            // The Roon API doesn't expose direct zone fetching methods
+                        }
+                    }
+                    last_zone_check = std::time::Instant::now();
                 }
                 match core_event {
                     roon_api::CoreEvent::Discovered(mut core, _) => {
@@ -574,23 +591,42 @@ impl RoonDaemon {
                         }
                         Parsed::Zones(zone_list) => {
                             println!("FLOW: Zones message received - count: {}", zone_list.len());
-                            if !zone_list.is_empty() {
-                                println!("FLOW: First zone - id: {}, display_name: {}, state: {:?}", 
-                                    &zone_list[0].zone_id[..8], zone_list[0].display_name, zone_list[0].state);
-                                if let Some(ref now_playing) = zone_list[0].now_playing {
-                                    println!("FLOW: Now playing - track: {}", now_playing.one_line.line1);
+                            
+                            // Reset zone refresh attempts since we got data
+                            zone_refresh_attempts = 0;
+                            
+                            // Validate zone data quality
+                            let mut valid_zones = 0;
+                            for (i, zone) in zone_list.iter().enumerate() {
+                                if !zone.zone_id.is_empty() && !zone.display_name.is_empty() {
+                                    valid_zones += 1;
+                                    if i == 0 {
+                                        println!("FLOW: First zone - id: {}, display_name: {}, state: {:?}", 
+                                            &zone.zone_id[..8.min(zone.zone_id.len())], zone.display_name, zone.state);
+                                        if let Some(ref now_playing) = zone.now_playing {
+                                            println!("FLOW: Now playing - track: {}", now_playing.one_line.line1);
+                                        } else {
+                                            println!("FLOW: No track currently playing");
+                                        }
+                                    }
+                                } else {
+                                    println!("FLOW: Warning - zone {} has incomplete data", i);
                                 }
                             }
+                            
+                            println!("FLOW: Zone validation - {}/{} zones have complete data", valid_zones, zone_list.len());
                             {
                                 let mut z = zones_clone_for_core.lock().unwrap();
                                 *z = zone_list;
                             }
                             println!("Daemon: Updated zone list (zones: {})", zones.lock().unwrap().len());
-                            // Mark as ready when we have zone data
-                            {
+                            // Mark as ready when we have valid zone data
+                            if valid_zones > 0 {
                                 let mut state = connection_state.lock().unwrap();
                                 *state = ConnectionState::Ready;
-                                println!("FLOW: Connection state -> Ready (zones available)");
+                                println!("FLOW: Connection state -> Ready ({} valid zones available)", valid_zones);
+                            } else {
+                                println!("FLOW: Warning - received zones but none have valid data, staying Connected");
                             }
                         }
                         _ => {
@@ -664,8 +700,17 @@ impl RoonDaemon {
         
         let zones = self.zones.lock().unwrap();
         println!("FLOW: get_status - zones.len(): {}", zones.len());
-        if let Some(zone) = zones.first() {
-            println!("FLOW: get_status - returning status for zone: {}", &zone.zone_id[..8]);
+        
+        // Smart zone selection: prefer zones with now_playing, then by state priority
+        let selected_zone = zones.iter().find(|zone| {
+            !zone.zone_id.is_empty() && zone.now_playing.is_some()
+        }).or_else(|| {
+            zones.iter().find(|zone| !zone.zone_id.is_empty())
+        });
+        
+        if let Some(zone) = selected_zone {
+            println!("FLOW: get_status - selected zone: {} (has_track: {})", 
+                &zone.zone_id[..8.min(zone.zone_id.len())], zone.now_playing.is_some());
             let text = if let Some(now_playing) = &zone.now_playing {
                 format!("♪ {}", now_playing.one_line.line1)
             } else {
@@ -745,13 +790,23 @@ impl RoonDaemon {
                 }
             };
             
-            let zone = match zones_guard.first() {
+            // Smart zone selection for transport - prefer zones with transport controls enabled
+            let selected_zone = zones_guard.iter().find(|zone| {
+                !zone.zone_id.is_empty() && (
+                    zone.is_play_allowed || zone.is_pause_allowed || 
+                    zone.is_next_allowed || zone.is_previous_allowed
+                )
+            }).or_else(|| {
+                zones_guard.iter().find(|zone| !zone.zone_id.is_empty())
+            });
+            
+            let zone = match selected_zone {
                 Some(z) => z.clone(),
                 None => {
                     return IpcResponse {
                         status: "error".to_string(),
                         data: None,
-                        message: Some("No zones available".to_string()),
+                        message: Some("No valid zones available for transport".to_string()),
                     };
                 }
             };
