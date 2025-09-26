@@ -189,7 +189,7 @@ async fn setup_authorization(ip: Option<&str>) -> Result<(), Box<dyn std::error:
                         println!("✓ Authorization successful! Extension is now paired.");
                         println!("RoonState: {:?}", state);
                         
-                        // Save the authorization state
+                        // Save the authorization state and connection info
                         let state_json = serde_json::json!({
                             "paired_core_id": state.paired_core_id,
                             "tokens": state.tokens
@@ -198,6 +198,17 @@ async fn setup_authorization(ip: Option<&str>) -> Result<(), Box<dyn std::error:
                             println!("Warning: Failed to save authorization state: {}", e);
                         } else {
                             println!("✓ Authorization state saved to {}/roonstate.json", config_path_for_save);
+                        }
+
+                        // Save connection details
+                        let connection_json = serde_json::json!({
+                            "ip": ip.map(|s| s.to_string()),
+                            "method": if ip.is_some() { "direct" } else { "discovery" }
+                        });
+                        if let Err(e) = RoonApi::save_config(&config_path_for_save, "connection", connection_json) {
+                            println!("Warning: Failed to save connection info: {}", e);
+                        } else {
+                            println!("✓ Connection info saved to {}/connection.json", config_path_for_save);
                         }
                         
                         // Don't break immediately - wait for zones to confirm stable connection
@@ -439,38 +450,90 @@ impl RoonDaemon {
         
         let services = Some(vec![Services::Transport(Transport::new())]);
         let provided = HashMap::new();
-        
-        let get_roon_state = move || -> RoonState {
-            let loaded_config = RoonApi::load_config(&config_path_str, "roonstate");
-            
-            if let Some(state) = loaded_config.as_object() {
-                RoonState {
-                    paired_core_id: state.get("paired_core_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    tokens: state.get("tokens").and_then(|v| v.as_object())
-                        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
-                        .unwrap_or_default(),
-                }
-            } else {
-                RoonState {
-                    paired_core_id: None,
-                    tokens: Default::default(),
+
+        // Create a function to generate get_roon_state closures
+        let make_get_roon_state = |config_path: String| {
+            move || -> RoonState {
+                let loaded_config = RoonApi::load_config(&config_path, "roonstate");
+
+                if let Some(state) = loaded_config.as_object() {
+                    RoonState {
+                        paired_core_id: state.get("paired_core_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        tokens: state.get("tokens").and_then(|v| v.as_object())
+                            .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
+                            .unwrap_or_default(),
+                    }
+                } else {
+                    RoonState {
+                        paired_core_id: None,
+                        tokens: Default::default(),
+                    }
                 }
             }
         };
         
-        // Try to connect directly to localhost if config exists
+        // Load connection preferences from saved config
         let config_file_path_for_check = config_path.join("config").to_string_lossy().to_string();
         let connection_result = if std::path::Path::new(&config_file_path_for_check).exists() {
-            println!("Daemon: Found existing auth, connecting directly to localhost");
-            use std::net::{IpAddr, Ipv4Addr};
-            use std::str::FromStr;
-            let ip = IpAddr::V4(Ipv4Addr::from_str("127.0.0.1").map_err(|e| e.to_string())?);
-            roon.ws_connect(Box::new(get_roon_state), provided, services, &ip, "9330").await
+            // Check if we have saved connection details
+            let connection_config = RoonApi::load_config(&config_path_str, "connection");
+            if let Some(connection) = connection_config.as_object() {
+                if let Some(saved_ip) = connection.get("ip").and_then(|v| v.as_str()) {
+                    println!("Daemon: Found saved connection IP: {}, attempting direct connection", saved_ip);
+                    use std::net::{IpAddr, Ipv4Addr};
+                    use std::str::FromStr;
+                    if let Ok(parsed_ip) = Ipv4Addr::from_str(saved_ip) {
+                        let ip = IpAddr::V4(parsed_ip);
+                        // Try direct connection first
+                        let mut roon_direct = RoonApi::new(create_roon_info());
+                        let result = roon_direct.ws_connect(Box::new(make_get_roon_state(config_path_str.clone())), provided, services, &ip, "9330").await;
+                        if result.is_some() {
+                            result
+                        } else {
+                            println!("Daemon: Direct connection to {} failed, falling back to discovery", saved_ip);
+                            timeout(
+                                Duration::from_secs(10),
+                                roon.start_discovery(Box::new(make_get_roon_state(config_path_str.clone())), HashMap::new(), Some(vec![Services::Transport(Transport::new())]))
+                            ).await.unwrap_or(None)
+                        }
+                    } else {
+                        println!("Daemon: Invalid saved IP {}, using discovery", saved_ip);
+                        timeout(
+                            Duration::from_secs(10),
+                            roon.start_discovery(Box::new(make_get_roon_state(config_path_str.clone())), provided, services)
+                        ).await.unwrap_or(None)
+                    }
+                } else {
+                    println!("Daemon: No saved IP found, using discovery");
+                    timeout(
+                        Duration::from_secs(10),
+                        roon.start_discovery(Box::new(make_get_roon_state(config_path_str.clone())), provided, services)
+                    ).await.unwrap_or(None)
+                }
+            } else {
+                // Backward compatibility: if no connection config, try localhost then discovery
+                println!("Daemon: Found existing auth but no connection config, trying localhost then discovery");
+                use std::net::{IpAddr, Ipv4Addr};
+                use std::str::FromStr;
+                let ip = IpAddr::V4(Ipv4Addr::from_str("127.0.0.1").map_err(|e| e.to_string())?);
+                // Try localhost first
+                let mut roon_localhost = RoonApi::new(create_roon_info());
+                let result = roon_localhost.ws_connect(Box::new(make_get_roon_state(config_path_str.clone())), HashMap::new(), Some(vec![Services::Transport(Transport::new())]), &ip, "9330").await;
+                if result.is_some() {
+                    result
+                } else {
+                    println!("Daemon: Localhost failed, falling back to discovery");
+                    timeout(
+                        Duration::from_secs(10),
+                        roon.start_discovery(Box::new(make_get_roon_state(config_path_str.clone())), provided, services)
+                    ).await.unwrap_or(None)
+                }
+            }
         } else {
             println!("Daemon: No existing auth found, trying discovery");
             timeout(
                 Duration::from_secs(10),
-                roon.start_discovery(Box::new(get_roon_state), provided, services)
+                roon.start_discovery(Box::new(make_get_roon_state(config_path_str.clone())), provided, services)
             ).await.unwrap_or(None)
         };
         
